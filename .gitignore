@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+*.elf
+*.bin
+
+# Editor / OS junk
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
