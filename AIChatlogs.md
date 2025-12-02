@@ -1279,3 +1279,53 @@ Type 'help' for commands.
 Try help and echo hi.
 
 If you get any new error messages after this change, paste them and we’ll keep debugging.
+
+Evan Ash
+Input -
+As of now the OS is running perfectly fine but it is at the most basic level. In the end it will only be a 'rough draft' of an actual OS so there is no need to make it too complex. My teammates and I are all working on separate parts of the system and I have been tasked with building a file system at the moment. You don't need to solve any dormant 'issues', or clean up any of the code that you were given, Right now I just need to implement a file system and get that running.
+
+Output (There were many errors in this code and a few follow up questions.) -
+Great — thanks, that’s perfect context. Below I’ll give you a small, self-contained in-memory filesystem you can drop into your repo, plus the exact integration steps so you can build & test it right away in QEMU.
+
+Highlights:
+
+Simple flat filesystem (no directories) stored in RAM.
+
+Fixed limits (easy to reason about): max files, max filename length, max bytes per file.
+
+API: fs_init(), fs_create(), fs_write(), fs_read(), fs_list(), fs_remove().
+
+Shell commands added: ls, cat <file>, write <file> <text>, rm <file>.
+
+Tiny and safe for a class "rough draft" — no persistence across reboots (we can add that later by embedding an image).
+
+I’ll show the full fs.h + fs.c, how to modify the Makefile, and the minimal changes to your kernel.c to register the commands. Your current kernel/shell is in src/kernel.c so we’ll patch that. (Your existing kernel file is here for reference.)
+5) Next improvements (optional ideas you can add later)
+
+Persistent image: put a small file-image into .rodata by generating a fs_image.h and changing fs_init() to load that image. (Good for demo files.)
+
+Larger files / dynamic allocation: switch from fixed-per-file buffers to a single big pool with simple allocator.
+
+Simple FAT-like layout: store a tiny header + directory in a contiguous region so you can build tools to create filesystem images on the host and embed them in the kernel ELF.
+
+Read-only embedding: generate const uint8_t fs_image[] and have fs_init() parse it.
+
+Permissions and file metadata: add timestamps, owner, etc., if required by your assignment.
+
+6) A few warnings / constraints
+
+This FS is in-memory only — reboots lose data. For a course rough-draft this is usually acceptable, but if you need persistence we can add host-side image generation and embed it into the kernel ELF.
+
+Limits: FS_FILE_MAX and FS_MAX_FILES are compile-time constants. Raise them if needed, but check memory footprint — on embedded/QEMU with limited RAM, keep sizes conservative.
+
+Keep uart_puts behavior in mind: writing binary data will be streamed directly to UART. You might want to add a hex dump display for non-text files.
+
+If you want, I’ll:
+
+Produce a patch (diff) you can apply directly, or
+
+Add an embedded sample file image and code to load it at boot, or
+
+Convert this to a tiny persistent image that your teammates can create on the host and embed into kernel.elf.
+
+Which of those would you like next?
