@@ -20,7 +20,7 @@ QEMU_MACHINE ?= virt
 # ==========
 # Files
 # ==========
-SRCS = src/kernel.c src/uart.c src/start.S
+SRCS = src/kernel.c src/uart.c src/fs.c src/start.S
 OBJS = $(SRCS:.c=.o)
 OBJS := $(OBJS:.S=.o)
 
