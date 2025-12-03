@@ -18,10 +18,7 @@ QEMU_MACHINE ?= virt
 # ==========
 # Files
 # ==========
-# put all C/assembly sources here (add loader/progs/user arrays under src/)
-SRCS = src/start.S src/uart.c src/kernel.c src/loader.c src/progs.c src/user_hello_bin.c
-
-# compute object list from SRCS
+SRCS = src/kernel.c src/uart.c src/fs.c src/start.S
 OBJS = $(SRCS:.c=.o)
 OBJS := $(OBJS:.S=.o)
 
