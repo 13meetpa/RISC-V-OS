@@ -55,31 +55,16 @@ static int str_equal(const char *a, const char *b) {
 
 /* run by name with debug output */
 int loader_run_by_name(const char *name) {
-    uart_puts("[LOADER] loader_run_by_name called with: '");
-    uart_puts(name ? name : "(null)");
-    uart_puts("'\n");
-
-    uart_puts("[LOADER] prog_table_count = ");
-    uart_print_u(prog_table_count);
 
     if (!name) {
-        uart_puts("[LOADER] name is NULL\n");
         return -1;
     }
 
 
     for (size_t i = 0; i < prog_table_count; ++i) {
-        uart_puts("[LOADER] entry ");
-        uart_print_u(i);
-        uart_puts(" name='");
-        uart_puts(prog_table[i].name ? prog_table[i].name : "(null)");
-        uart_puts("'\n");
 
         /* compare */
         if (prog_table[i].name && str_equal(name, prog_table[i].name)) {
-            uart_puts("[LOADER] MATCH at index ");
-            uart_print_u(i);
-            uart_puts("\n");
             /* found -> load and jump */
             if (!prog_table[i].data || prog_table[i].size == 0) {
                 uart_puts("[LOADER] error: program has no data or size==0\n");
@@ -96,7 +81,6 @@ int loader_run_by_name(const char *name) {
             uintptr_t entry = (uintptr_t)(prog_table[i].entry ? prog_table[i].entry : (const void*)PROG_LOAD_ADDR);
             uintptr_t user_sp = PROG_STACK_ADDR;
 
-            uart_puts("[LOADER] jumping to entry at 0x");
             /* hex print (simple) */
             {
                 uintptr_t x = entry;
@@ -110,8 +94,6 @@ int loader_run_by_name(const char *name) {
                     x >>= 4;
                 }
                 /* print */
-                uart_puts(hx);
-                uart_puts("\n");
             }
 
             /* set sp and jump; jalr sets ra so ret returns here */
@@ -134,7 +116,6 @@ int loader_run_by_name(const char *name) {
             /* --------------------------------------------------------------- */
 
 
-            uart_puts("\n[LOADER] program returned to loader\n");
             return 0;
         } else {
             uart_puts("[LOADER] no match for this entry\n");

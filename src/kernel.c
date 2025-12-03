@@ -215,6 +215,7 @@ void kmain(void) {
                     uart_puts("Program not found: ");
                     uart_puts(namebuf);
                     uart_puts("\n");
+                } else {
                 }
             }
         }
