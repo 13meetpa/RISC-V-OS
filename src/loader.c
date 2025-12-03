@@ -1,0 +1,136 @@
+/* src/loader.c - instrumented loader with debug prints */
+#include "loader.h"
+#include "uart.h"
+#include <stdint.h>
+#include <stddef.h>
+
+/* Addresses must match what kernel expects */
+#define PROG_LOAD_ADDR  0x80200000UL
+#define PROG_STACK_ADDR 0x80300000UL
+#define PROG_STACK_SIZE (16*1024)
+
+/* tiny memcpy */
+static void *kmemcpy(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+/* helper to print integer (decimal) */
+static void uart_print_u(size_t v) {
+    if (v == 0) { uart_putc('0'); uart_putc('\n'); return; }
+    char buf[32];
+    int i = 0;
+    while (v > 0 && i < (int)sizeof(buf)-1) {
+        buf[i++] = '0' + (v % 10);
+        v /= 10;
+    }
+    for (int j = i-1; j >= 0; --j) uart_putc(buf[j]);
+    uart_putc('\n');
+}
+
+/* list programs */
+void loader_list_programs(void) {
+    uart_puts("Programs:\n");
+    if (prog_table_count == 0) {
+        uart_puts("  (none)\n");
+        return;
+    }
+    for (size_t i = 0; i < prog_table_count; ++i) {
+        uart_puts("  ");
+        uart_puts(prog_table[i].name);
+        uart_puts("\n");
+    }
+}
+
+/* robust exact-string compare (returns 1 if equal) */
+static int str_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* run by name with debug output */
+int loader_run_by_name(const char *name) {
+    uart_puts("[LOADER] loader_run_by_name called with: '");
+    uart_puts(name ? name : "(null)");
+    uart_puts("'\n");
+
+    uart_puts("[LOADER] prog_table_count = ");
+    uart_print_u(prog_table_count);
+
+    if (!name) {
+        uart_puts("[LOADER] name is NULL\n");
+        return -1;
+    }
+
+
+    for (size_t i = 0; i < prog_table_count; ++i) {
+        uart_puts("[LOADER] entry ");
+        uart_print_u(i);
+        uart_puts(" name='");
+        uart_puts(prog_table[i].name ? prog_table[i].name : "(null)");
+        uart_puts("'\n");
+
+        /* compare */
+        if (prog_table[i].name && str_equal(name, prog_table[i].name)) {
+            uart_puts("[LOADER] MATCH at index ");
+            uart_print_u(i);
+            uart_puts("\n");
+            /* found -> load and jump */
+            if (!prog_table[i].data || prog_table[i].size == 0) {
+                uart_puts("[LOADER] error: program has no data or size==0\n");
+                return -1;
+            }
+
+            uart_puts("Loading program: ");
+            uart_puts(prog_table[i].name);
+            uart_puts("\n");
+
+            /* copy program to load address */
+            kmemcpy((void*)PROG_LOAD_ADDR, prog_table[i].data, prog_table[i].size);
+
+            uintptr_t entry = (uintptr_t)(prog_table[i].entry ? prog_table[i].entry : (const void*)PROG_LOAD_ADDR);
+            uintptr_t user_sp = PROG_STACK_ADDR;
+
+            uart_puts("[LOADER] jumping to entry at 0x");
+            /* hex print (simple) */
+            {
+                uintptr_t x = entry;
+                char hx[17];
+                for (int k = 0; k < 16; ++k) hx[k] = '0';
+                hx[16] = '\0';
+                int pos = 15;
+                while (x && pos >= 0) {
+                    int ny = x & 0xF;
+                    hx[pos--] = (ny < 10) ? ('0' + ny) : ('a' + (ny - 10));
+                    x >>= 4;
+                }
+                /* print */
+                uart_puts(hx);
+                uart_puts("\n");
+            }
+
+            /* set sp and jump; jalr sets ra so ret returns here */
+            asm volatile (
+                "mv t0, %0\n"
+                "mv sp, %1\n"
+                "jalr ra, t0, 0\n"
+                :
+                : "r"(entry), "r"(user_sp)
+                : "t0", "ra"
+            );
+
+            uart_puts("\n[LOADER] program returned to loader\n");
+            return 0;
+        } else {
+            uart_puts("[LOADER] no match for this entry\n");
+        }
+    }
+
+    uart_puts("[LOADER] no matches found\n");
+    return -1;
+}

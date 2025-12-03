@@ -1,9 +1,7 @@
-# ==========
+# ========== 
 # Toolchain
 # ==========
-# Default: GCC bare-metal toolchain (change via environment)
 CROSS_COMPILE ?= riscv64-unknown-elf-
-
 CC      = $(CROSS_COMPILE)gcc
 LD      = $(CROSS_COMPILE)ld
 OBJCOPY = $(CROSS_COMPILE)objcopy
@@ -20,7 +18,10 @@ QEMU_MACHINE ?= virt
 # ==========
 # Files
 # ==========
-SRCS = src/kernel.c src/uart.c src/start.S
+# put all C/assembly sources here (add loader/progs/user arrays under src/)
+SRCS = src/start.S src/uart.c src/kernel.c src/loader.c src/progs.c src/user_hello_bin.c
+
+# compute object list from SRCS
 OBJS = $(SRCS:.c=.o)
 OBJS := $(OBJS:.S=.o)
 

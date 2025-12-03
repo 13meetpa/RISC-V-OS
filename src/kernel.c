@@ -1,5 +1,9 @@
 #include <stdint.h>
 #include "uart.h"
+#include "loader.h"
+
+
+
 
 static void read_line(char *buf, int max) {
     int i = 0;
@@ -51,7 +55,59 @@ void kmain(void) {
             uart_puts("Pretending to reboot... (not implemented)\n");
         } else if (line[0] == '\0') {
             // empty line: ignore
+        } else if (streq(line, "lsprogs")) {
+            loader_list_programs();
+        } else if (line[0] == 'r' && line[1] == 'u' && line[2] == 'n' && line[3] == ' ') {
+
+    uart_puts("[DEBUG] raw input after 'run ': '");
+    uart_puts(line + 4);
+    uart_puts("'\n");
+
+    const char *p = line + 4;
+
+    /* skip leading spaces */
+    while (*p == ' ') p++;
+
+    char namebuf[64];
+    int ni = 0;
+
+    /* copy characters */
+    while (*p != '\0' && ni < (int)(sizeof(namebuf)-1)) {
+        namebuf[ni++] = *p++;
+    }
+
+    /* trim trailing garbage */
+    while (ni > 0 &&
+          (namebuf[ni-1] == ' ' ||
+           namebuf[ni-1] == '\r' ||
+           namebuf[ni-1] == '\n' ||
+           namebuf[ni-1] == '\t'))
+    {
+        ni--;
+    }
+
+    namebuf[ni] = '\0';
+
+    uart_puts("[DEBUG] final parsed name: '");
+    uart_puts(namebuf);
+    uart_puts("'\n");
+
+    if (ni == 0) {
+        uart_puts("[DEBUG] name empty!\n");
+    } else {
+        int r = loader_run_by_name(namebuf);
+        if (r < 0) {
+            uart_puts("[DEBUG] loader_run_by_name() returned -1\n");
+            uart_puts("Program not found: ");
+            uart_puts(namebuf);
+            uart_puts("\n");
         } else {
+            uart_puts("[DEBUG] loader_run_by_name() returned success\n");
+        }
+    }
+}
+
+        else {
             uart_puts("Unknown command: ");
             uart_puts(line);
             uart_puts("\n");
