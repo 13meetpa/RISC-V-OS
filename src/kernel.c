@@ -113,6 +113,8 @@ void kmain(void) {
             uart_puts("  cat <file>     - show file contents\n");
             uart_puts("  write <f> <t>  - write text to file (overwrite/create)\n");
             uart_puts("  rm <file>      - remove file\n");
+            uart_puts("  lsprogs        - lists programs\n");
+            uart_puts("  run <program>  - runs a program\n");
             uart_puts("  reboot         - not implemented (message only)\n");
         }
         else if (kstrncmp(line, "echo", 4) == 0) {
@@ -180,10 +182,6 @@ void kmain(void) {
             loader_list_programs();
         } else if (line[0] == 'r' && line[1] == 'u' && line[2] == 'n' && line[3] == ' ') {
 
-            uart_puts("[DEBUG] raw input after 'run ': '");
-            uart_puts(line + 4);
-            uart_puts("'\n");
-
             const char *p = line + 4;
 
             /* skip leading spaces */
@@ -209,21 +207,14 @@ void kmain(void) {
 
             namebuf[ni] = '\0';
 
-            uart_puts("[DEBUG] final parsed name: '");
-            uart_puts(namebuf);
-            uart_puts("'\n");
-
             if (ni == 0) {
-                uart_puts("[DEBUG] name empty!\n");
+                uart_puts("Program name empty\n");
             } else {
                 int r = loader_run_by_name(namebuf);
                 if (r < 0) {
-                    uart_puts("[DEBUG] loader_run_by_name() returned -1\n");
                     uart_puts("Program not found: ");
                     uart_puts(namebuf);
                     uart_puts("\n");
-                } else {
-                    uart_puts("[DEBUG] loader_run_by_name() returned success\n");
                 }
             }
         }

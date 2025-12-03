@@ -115,14 +115,24 @@ int loader_run_by_name(const char *name) {
             }
 
             /* set sp and jump; jalr sets ra so ret returns here */
-            asm volatile (
-                "mv t0, %0\n"
-                "mv sp, %1\n"
-                "jalr ra, t0, 0\n"
-                :
-                : "r"(entry), "r"(user_sp)
-                : "t0", "ra"
-            );
+            /* ----------------- replace jalr block with this ----------------- */
+            /* Save loader SP */
+            uintptr_t loader_sp;
+            asm volatile("mv %0, sp" : "=r"(loader_sp));
+
+            /* Set user stack */
+            asm volatile("mv sp, %0" :: "r"(user_sp) : );
+
+            /* Call the entry as a function so `ret` returns to us. */
+            typedef void (*user_fn_t)(void);
+            user_fn_t fn = (user_fn_t)entry;
+            fn();   /* user program runs and should return using 'ret' */
+
+            /* Restore loader SP */
+            asm volatile("mv sp, %0" :: "r"(loader_sp) : );
+
+            /* --------------------------------------------------------------- */
+
 
             uart_puts("\n[LOADER] program returned to loader\n");
             return 0;

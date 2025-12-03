@@ -1,17 +1,14 @@
-/* src/progs.c - program table using const length from xxd-generated array */
-#include <stddef.h>
-#include <stdint.h>
-#include "loader.h"
+/* src/progs.c */
+#include "progs.h"
 
-/* xxd generates:
-   unsigned char user_hello_bin[] = { ... };
-   const unsigned int user_hello_bin_len = N;
-*/
-extern const unsigned char user_hello_bin[];
-extern const unsigned int user_hello_bin_len;
+/* This file must contain the actual array definition:
+   e.g. unsigned char user_hello_bin[] = {0x7f, 0x45, ... };
+   Many tools produce a .c file that defines the array; include it here. */
+#include "user_hello_bin.c"   /* <-- ensure this path is correct relative to src/ */
 
+/* Now sizeof(user_hello_bin) is an integer constant expression. */
 prog_t prog_table[] = {
-    { "hello", (const uint8_t*)user_hello_bin, (size_t)user_hello_bin_len, (const void*)0x80200000 },
+    { "hello", (const uint8_t*)user_hello_bin, (size_t)sizeof(user_hello_bin), (const void*)0x80200000 },
 };
 
-size_t prog_table_count = sizeof(prog_table) / sizeof(prog_table[0]);
+const size_t prog_table_count = sizeof(prog_table) / sizeof(prog_table[0]);

@@ -1,6 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
-
+#include <prog.h>
 #include "user_hello_bin.c" /* or better: include the generated header that declares the array */
 
 extern const unsigned char user_hello_bin[];
