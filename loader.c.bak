@@ -1,0 +1,197 @@
+/* loader.c -- instrumented loader that dumps loaded program bytes */
+#include "loader.h"
+#include "uart.h"
+#include <stdint.h>
+#include <stddef.h>
+
+/* Addresses must match what kernel expects */
+#define PROG_LOAD_ADDR  0x80200000UL
+#define PROG_STACK_ADDR 0x80300000UL
+
+static void *kmemcpy(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+/* print byte as two hex chars */
+static void put_hex_byte(uint8_t b) {
+    char hi = (b >> 4) & 0xF;
+    char lo = b & 0xF;
+    uart_putc(hi < 10 ? '0' + hi : 'a' + (hi-10));
+    uart_putc(lo < 10 ? '0' + lo : 'a' + (lo-10));
+}
+
+/* dump memory at addr for len bytes (hex + ascii) */
+static void dump_memory_hex_ascii(const void *addr, size_t len) {
+    const uint8_t *p = (const uint8_t *)addr;
+    for (size_t i = 0; i < len; i += 16) {
+        /* print offset-ish */
+        uart_putc('0'); uart_putc('x');
+        /* simple hex of address low 8 nibbles (not full, but enough) */
+        uintptr_t a = (uintptr_t)(addr) + i;
+        char hx[17];
+        for (int k = 0; k < 16; ++k) hx[k] = '0';
+        hx[16] = '\0';
+        int pos = 15;
+        uintptr_t x = a;
+        while (x && pos >= 0) {
+            int ny = x & 0xF;
+            hx[pos--] = (ny < 10) ? ('0' + ny) : ('a' + (ny - 10));
+            x >>= 4;
+        }
+        uart_puts(hx);
+        uart_putc(':'); uart_putc(' ');
+
+        /* hex bytes */
+        for (size_t j = 0; j < 16; ++j) {
+            if (i + j < len) {
+                put_hex_byte(p[i + j]);
+                uart_putc(' ');
+            } else {
+                /* padding */
+                uart_putc(' '); uart_putc(' '); uart_putc(' ');
+            }
+        }
+        uart_putc(' ');
+
+        /* ascii */
+        for (size_t j = 0; j < 16; ++j) {
+            if (i + j < len) {
+                uint8_t c = p[i + j];
+                if (c >= 32 && c < 127) uart_putc(c);
+                else uart_putc('.');
+            } else {
+                uart_putc(' ');
+            }
+        }
+        uart_putc('\n');
+    }
+}
+
+/* robust exact-string compare (returns 1 if equal) */
+static int str_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+int loader_run_by_name(const char *name) {
+    if (!name) return -1;
+
+    uart_puts("[DEBUG] loader_run_by_name called with name='");
+    uart_puts(name);
+    uart_puts("'\n");
+
+    uart_puts("[DEBUG] prog_table_count = ");
+    /* print small int */
+    if (prog_table_count == 0) uart_puts("0\n");
+    else { char buf[8]; int n = 0; size_t v = prog_table_count; while (v) { buf[n++] = '0' + (v%10); v/=10; } if (n==0) uart_putc('0'); else { for (int i=n-1;i>=0;--i) uart_putc(buf[i]); } uart_putc('\n'); }
+
+    for (size_t i = 0; i < prog_table_count; ++i) {
+        uart_puts("[DEBUG] entry ");
+        uart_putc('0' + (char)((i/10)%10));
+        uart_putc('0' + (char)(i%10));
+        uart_puts(": name='");
+        uart_puts(prog_table[i].name ? prog_table[i].name : "(null)");
+        uart_puts("', size=");
+        /* print size */
+        { size_t v = prog_table[i].size; char buf[16]; int n=0; if (v==0) { uart_putc('0'); uart_putc('\n'); } else { while (v) { buf[n++]= '0' + (v%10); v/=10; } for (int j=n-1;j>=0;--j) uart_putc(buf[j]); uart_putc('\n'); } }
+    }
+
+    for (size_t i = 0; i < prog_table_count; ++i) {
+        uart_puts("[DEBUG] comparing to entry ");
+        uart_putc('0' + (char)((i/10)%10));
+        uart_putc('0' + (char)(i%10));
+        uart_puts(": '");
+        uart_puts(prog_table[i].name ? prog_table[i].name : "(null)");
+        uart_puts("'\n");
+
+        if (prog_table[i].name && str_equal(name, prog_table[i].name)) {
+            uart_puts("[DEBUG] MATCH FOUND for entry ");
+            uart_putc('0' + (char)((i/10)%10));
+            uart_putc('0' + (char)(i%10));
+            uart_puts("\n");
+
+            if (!prog_table[i].data || prog_table[i].size == 0) {
+                uart_puts("[LOADER] error: program has no data or size==0\n");
+                return -1;
+            }
+
+            uart_puts("Loading program: ");
+            uart_puts(prog_table[i].name);
+            uart_puts("\n");
+
+            /* copy program to load address */
+            kmemcpy((void*)PROG_LOAD_ADDR, prog_table[i].data, prog_table[i].size);
+
+            /* DUMP the first 128 bytes of loaded program for diagnosis */
+            uart_puts("[DEBUG] DUMP of loaded program (first 128 bytes):\n");
+            dump_memory_hex_ascii((void*)PROG_LOAD_ADDR, (prog_table[i].size < 128) ? prog_table[i].size : 128);
+
+            uintptr_t entry = (uintptr_t)(prog_table[i].entry ? prog_table[i].entry : (const void*)PROG_LOAD_ADDR);
+            uintptr_t user_sp = PROG_STACK_ADDR;
+
+            uart_puts("[DEBUG] entry addr = 0x");
+            /* print entry (simple) */
+            {
+                uintptr_t x = entry;
+                char hx[17];
+                for (int k = 0; k < 16; ++k) hx[k] = '0';
+                hx[16] = '\0';
+                int pos = 15;
+                while (x && pos >= 0) {
+                    int ny = x & 0xF;
+                    hx[pos--] = (ny < 10) ? ('0' + ny) : ('a' + (ny - 10));
+                    x >>= 4;
+                }
+                uart_puts(hx);
+                uart_putc('\n');
+            }
+
+            uart_puts("[DEBUG] user_sp = 0x");
+            {
+                uintptr_t x = user_sp;
+                char hx[17];
+                for (int k = 0; k < 16; ++k) hx[k] = '0';
+                hx[16] = '\0';
+                int pos = 15;
+                while (x && pos >= 0) {
+                    int ny = x & 0xF;
+                    hx[pos--] = (ny < 10) ? ('0' + ny) : ('a' + (ny - 10));
+                    x >>= 4;
+                }
+                uart_puts(hx);
+                uart_putc('\n');
+            }
+
+            /* Save loader SP */
+            uintptr_t loader_sp;
+            asm volatile("mv %0, sp" : "=r"(loader_sp));
+
+            /* Set user stack */
+            asm volatile("mv sp, %0" :: "r"(user_sp) : );
+
+            uart_puts("[DEBUG] calling user entry...\n");
+
+            typedef void (*user_fn_t)(void);
+            user_fn_t fn = (user_fn_t)entry;
+            fn();
+
+            uart_puts("[DEBUG] user entry returned\n");
+
+            /* Restore loader SP */
+            asm volatile("mv sp, %0" :: "r"(loader_sp) : );
+
+            return 0;
+        } else {
+            uart_puts("[LOADER] no match for this entry\n");
+        }
+    }
+
+    uart_puts("[LOADER] no matches found\n");
+    return -1;
+}
