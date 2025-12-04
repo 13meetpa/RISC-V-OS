@@ -22,7 +22,79 @@ static int kstrncmp(const char *a, const char *b, int n) {
     }
     return 0;
 }
+/* ---- Shell cwd helper ---- */
+static char cwd[128] = "/"; /* default root */
 
+/* join path: if 'path' starts with '/', return it as absolute; otherwise produce joined path into outbuf */
+static void join_path(const char *path, char *outbuf, int outlen) {
+    if (!path || path[0] == '\0') {
+        /* copy cwd */
+        int i = 0;
+        while (cwd[i] && i + 1 < outlen) { outbuf[i] = cwd[i]; i++; }
+        outbuf[i] = '\0';
+        return;
+    }
+    if (path[0] == '/') {
+        /* absolute */
+        int i = 0;
+        while (path[i] && i + 1 < outlen) { outbuf[i] = path[i]; i++; }
+        outbuf[i] = '\0';
+        return;
+    }
+    /* relative: if cwd is "/" then result is "/name" else "cwd/name" */
+    int ci = 0, oi = 0;
+    if (cwd[0] == '/' && cwd[1] == '\0') {
+        if (oi + 1 < outlen) outbuf[oi++] = '/';
+    } else {
+        while (cwd[ci] && oi + 1 < outlen) outbuf[oi++] = cwd[ci++];
+        if (oi + 1 < outlen && outbuf[oi-1] != '/') outbuf[oi++] = '/';
+    }
+    int pi = 0;
+    while (path[pi] && oi + 1 < outlen) outbuf[oi++] = path[pi++];
+    outbuf[oi] = '\0';
+}
+
+/* cd command: change cwd if directory exists */
+static int shell_cd(const char *arg) {
+    char full[128];
+    join_path(arg, full, sizeof(full));
+    if (full[0] == '\0') return -1;
+    if (full[0] != '/') {
+        /* ensure leading slash */
+        char tmp[128];
+        tmp[0] = '/';
+        int i = 1; int j = 0;
+        while (full[j] && i + 1 < (int)sizeof(tmp)) tmp[i++] = full[j++];
+        tmp[i] = '\0';
+        for (int k = 0; k <= i; k++) full[k] = tmp[k];
+    }
+    int idx = fs_resolve(full);
+    if (idx < 0) return -1;
+    /* must be dir */
+    extern fs_entry_t fs_entries[]; /* we can't reference fs_entries directly; we can rely on fs_list_dir to check */
+    /* safer: test by listing */
+    if (fs_list_dir(full, (fs_list_cb_t)0, NULL) != 0) return -1;
+    /* copy full into cwd */
+    int ci = 0;
+    while (full[ci] && ci + 1 < (int)sizeof(cwd)) { cwd[ci] = full[ci]; ci++; }
+    cwd[ci] = '\0';
+    return 0;
+}
+
+/* pwd */
+static void shell_pwd(void) {
+    uart_puts(cwd);
+    uart_puts("\n");
+}
+
+/* callback for listing that prints directories with a slash */
+static void fs_list_cb_shell(const char *name, uint32_t size, uint8_t is_dir, void *cookie) {
+    (void)cookie;
+    uart_puts("  ");
+    uart_puts(name);
+    if (is_dir) uart_puts("/");
+    uart_puts("\n");
+}
 
 /* --- helpers --- */
 
@@ -93,11 +165,13 @@ static void fs_list_cb(const char *name, uint32_t size, void *cookie) {
 void kmain(void) {
     uart_puts("Simple RISC-V OS booted!\n");
     uart_puts("Type 'help' for commands.\n\n");
-
-    /* init filesystem and create a sample file */
+    
+    /* Initialize filesystem (fs_init is provided by src/fs.c) */
     fs_init();
+
+    /* create a sample file at root */
     const char *msg = "Hello from the simple FS!\n";
-    fs_create("hello.txt", (const uint8_t*)msg, (uint32_t)kstrlen(msg));
+    fs_write_path("/hello.txt", (const uint8_t*)msg, (uint32_t)kstrlen(msg));
 
     char line[128];
 
@@ -117,60 +191,172 @@ void kmain(void) {
             uart_puts("  run <program>  - runs a program\n");
             uart_puts("  reboot         - not implemented (message only)\n");
         }
+        
         else if (kstrncmp(line, "echo", 4) == 0) {
             const char *p = line + 4;
             if (*p == ' ') p++;
             uart_puts(p);
             uart_puts("\n");
         }
-        else if (streq(line, "ls")) {
-            uart_puts("Files:\n");
-            fs_list(fs_list_cb, NULL);
+
+        else if (kstrncmp(line, "ls", 2) == 0 && (line[2] == '\0' || line[2] == ' ')) {
+            const char *arg = line + 2;
+            if (*arg == ' ') arg++;
+            char pathbuf[128];
+            if (*arg == '\0') {
+                join_path("", pathbuf, sizeof(pathbuf)); /* cwd */
+            } else {
+                join_path(arg, pathbuf, sizeof(pathbuf));
+            }
+            const char *listpath = pathbuf;
+            if (pathbuf[0] == '\0') listpath = "/";  /* safe fallback */
+            if (fs_list_dir(listpath, fs_list_cb_shell, NULL) != 0) {
+                uart_puts("Not a directory or not found\n");
+            }
         }
+
         else if (kstrncmp(line, "cat ", 4) == 0) {
             const char *name = line + 4;
             if (*name) {
+                char pathbuf[128];
+                join_path(name, pathbuf, sizeof(pathbuf));
+
                 uint8_t buf[FS_FILE_MAX];
-                int r = fs_read(name, buf, sizeof(buf));
+                int r = fs_read_path(pathbuf, buf, sizeof(buf));
                 if (r < 0) {
-                    uart_puts("File not found\n");
+                    uart_puts("File not found or is a directory\n");
                 } else {
                     for (int i = 0; i < r; i++) uart_putc((char)buf[i]);
-                    /* ensure newline after file output */
                     uart_putc('\n');
                 }
             } else {
-                uart_puts("Usage: cat <filename>\n");
+                uart_puts("Usage: cat <path>\n");
             }
         }
+
+        /* write <path> <text> */
         else if (kstrncmp(line, "write ", 6) == 0) {
-            /* write <name> <text> */
             char *p = line + 6;
-            if (*p == '\0') {
-                uart_puts("Usage: write <filename> <text>\n");
-            } else {
-                /* find first space separating name and text */
+            if (*p == '\0') { uart_puts("Usage: write <path> <text>\n"); }
+            else {
                 char *space = p;
                 while (*space && *space != ' ') space++;
-                if (*space == '\0') {
-                    uart_puts("Usage: write <filename> <text>\n");
-                } else {
+                if (*space == '\0') { uart_puts("Usage: write <path> <text>\n"); }
+                else {
                     *space = '\0';
                     const char *name = p;
                     const char *text = space + 1;
-                    fs_write(name, (const uint8_t*)text, (uint32_t)kstrlen(text));
-                    uart_puts("OK\n");
+                    char pathbuf[128];
+                    join_path(name, pathbuf, sizeof(pathbuf));
+                    if (fs_write_path(pathbuf, (const uint8_t*)text, (uint32_t)kstrlen(text)) == 0) uart_puts("OK\n");
+                    else uart_puts("write failed\n");
                 }
             }
         }
+
+        /* rm <path> */
         else if (kstrncmp(line, "rm ", 3) == 0) {
             const char *name = line + 3;
             if (*name) {
-                int r = fs_remove(name);
+                char pathbuf[128];
+                join_path(name, pathbuf, sizeof(pathbuf));
+                int r = fs_remove_path(pathbuf);
                 if (r == 0) uart_puts("Removed\n");
-                else uart_puts("File not found\n");
+                else uart_puts("File not found or not a file\n");
             } else {
-                uart_puts("Usage: rm <filename>\n");
+                uart_puts("Usage: rm <path>\n");
+            }
+        }
+
+        /* ls [path] */
+        else if (kstrncmp(line, "ls", 2) == 0 && (line[2] == '\0' || line[2] == ' ')) {
+            const char *arg = line + 2;
+            if (*arg == ' ') arg++;
+            char pathbuf[128];
+            if (*arg == '\0') {
+                /* list cwd */
+                join_path("", pathbuf, sizeof(pathbuf));
+            } else {
+                join_path(arg, pathbuf, sizeof(pathbuf));
+            }
+            if (fs_list_dir(pathbuf, fs_list_cb_shell, NULL) != 0) {
+                uart_puts("Not a directory or not found\n");
+            }
+        }
+
+        /* mkdir <path> */
+        else if (kstrncmp(line, "mkdir ", 6) == 0) {
+            const char *arg = line + 6;
+            if (*arg == '\0') { uart_puts("Usage: mkdir <path>\n"); }
+            else {
+                char pathbuf[128];
+                join_path(arg, pathbuf, sizeof(pathbuf));
+                if (fs_mkdir(pathbuf) == 0) uart_puts("OK\n");
+                else uart_puts("mkdir failed\n");
+            }
+        }
+
+        /* rmdir <path> */
+        else if (kstrncmp(line, "rmdir ", 6) == 0) {
+            const char *arg = line + 6;
+            if (*arg == '\0') { uart_puts("Usage: rmdir <path>\n"); }
+            else {
+                char pathbuf[128];
+                join_path(arg, pathbuf, sizeof(pathbuf));
+                if (fs_rmdir(pathbuf) == 0) uart_puts("Removed\n");
+                else uart_puts("rmdir failed (non-empty or not found)\n");
+            }
+        }
+
+        /* cd <path> */
+        else if (kstrncmp(line, "cd ", 3) == 0) {
+            const char *arg = line + 3;
+            if (*arg == '\0') { uart_puts("Usage: cd <path>\n"); }
+            else {
+                if (shell_cd(arg) == 0) uart_puts("OK\n");
+                else uart_puts("cd failed\n");
+            }
+        }
+
+        /* pwd */
+        else if (streq(line, "pwd")) {
+            shell_pwd();
+        }
+
+        /* write and cat commands: use join_path to resolve full path before calling fs_* */
+        else if (kstrncmp(line, "cat ", 4) == 0) {
+            const char *name = line + 4;
+            if (*name) {
+                char pathbuf[128];
+                join_path(name, pathbuf, sizeof(pathbuf));
+                uint8_t buf[FS_FILE_MAX];
+                int r = fs_read_path(pathbuf, buf, sizeof(buf));
+                if (r < 0) {
+                    uart_puts("File not found or is a directory\n");
+                } else {
+                    for (int i = 0; i < r; i++) uart_putc((char)buf[i]);
+                    uart_putc('\n');
+                }
+            } else {
+                uart_puts("Usage: cat <path>\n");
+            }
+        }
+        else if (kstrncmp(line, "write ", 6) == 0) {
+            char *p = line + 6;
+            if (*p == '\0') { uart_puts("Usage: write <path> <text>\n"); }
+            else {
+                char *space = p;
+                while (*space && *space != ' ') space++;
+                if (*space == '\0') { uart_puts("Usage: write <path> <text>\n"); }
+                else {
+                    *space = '\0';
+                    const char *name = p;
+                    const char *text = space + 1;
+                    char pathbuf[128];
+                    join_path(name, pathbuf, sizeof(pathbuf));
+                    if (fs_write_path(pathbuf, (const uint8_t*)text, (uint32_t)kstrlen(text)) == 0) uart_puts("OK\n");
+                    else uart_puts("write failed\n");
+                }
             }
         }
         else if (streq(line, "reboot")) {
