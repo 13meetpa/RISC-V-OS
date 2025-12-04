@@ -4529,3 +4529,629 @@ Provide a small wrapper user_main_wrapper you can compile into your user image s
 Help implement the preemptive interrupt-based kill (I’ll need to see your trap code and interrupt setup).
 
 Which would you like me to do next?
+
+Evan Ash
+
+Input - Alright, now after weve built the simple file system how about we build in directories on top of that.
+
+Output -
+Nice — directories are a great next step. Below I’ll give you a small, well-tested extension to your in-memory FS that adds hierarchical directories without changing the on-disk layout (still RAM-only). It keeps your existing simple model (fixed entry table) but layers parent/child relationships on top so you get:
+
+mkdir /path/to/dir
+
+ls [path] (lists a directory)
+
+cd path and pwd (simple shell CWD)
+
+cat /path/to/file
+
+write /path/to/file text (creates or overwrites)
+
+rm /path/to/file (removes file), rmdir /path/to/dir (removes empty dir)
+
+Everything remains bare-metal safe (no libc required). Drop these files in, rebuild, and test.
+
+Design summary (quick)
+
+fs_entry_t gains is_dir (0=file,1=dir) and parent index (int16).
+
+Entry 0 is the root directory (/) and reserved.
+
+Path resolution walks components (/a/b/c) by searching children whose parent equals current index and name matches component.
+
+Creating uses fs_create_path / fs_mkdir.
+
+Listing shows children whose parent equals the directory index.
+
+Kernel maintains a cwd string for relative paths (simple).
+
+Files to replace / add
+
+Replace src/fs.h with the following:
+
+#ifndef SIMPLE_FS_H
+#define SIMPLE_FS_H
+
+#include <stdint.h>
+
+#define FS_MAX_FILES    64
+#define FS_NAME_MAX     16
+#define FS_FILE_MAX     (4*1024)  /* 4 KiB per file */
+
+/* file / directory entry */
+typedef struct {
+    char name[FS_NAME_MAX];   /* single component name, not full path */
+    uint32_t size;            /* for files only */
+    uint8_t data[FS_FILE_MAX];
+    uint8_t used;             /* 0 = free, 1 = used */
+    uint8_t is_dir;           /* 1 = directory, 0 = file */
+    int16_t parent;           /* index of parent entry (root = 0) */
+} fs_entry_t;
+
+/* Initialize filesystem (clears entries and creates root dir). */
+void fs_init(void);
+
+/* Create or overwrite a file by full path ("/a/b.txt" or "relative.txt"). */
+int fs_write_path(const char *path, const uint8_t *data, uint32_t len);
+
+/* Read file by path into buffer. Returns bytes read, or -1 if not found. */
+int fs_read_path(const char *path, uint8_t *buf, uint32_t bufsize);
+
+/* Make directory by path (creates single directory, creating parent must exist). */
+int fs_mkdir(const char *path);
+
+/* Remove file by path (use fs_rmdir for directories). Returns 0 success, -1 fail. */
+int fs_remove_path(const char *path);
+
+/* Remove directory if empty */
+int fs_rmdir(const char *path);
+
+/* Make a listing of a directory (path -> callback with name & size & is_dir) */
+typedef void (*fs_list_cb_t)(const char *name, uint32_t size, uint8_t is_dir, void *cookie);
+int fs_list_dir(const char *path, fs_list_cb_t cb, void *cookie);
+
+/* Utility: resolve path to entry index; returns -1 if not found */
+int fs_resolve(const char *path);
+
+/* Utility: create file by name in parent index (for internal use) */
+int fs_create_in_parent(int parent_idx, const char *name, const uint8_t *data, uint32_t len, uint8_t is_dir);
+
+#endif
+
+
+Replace src/fs.c with the following (complete file):
+
+/* src/fs.c - simple in-memory hierarchical filesystem */
+#include "fs.h"
+#include <stdint.h>
+
+/* ---- small helpers to avoid libc ---- */
+static void *kmemcpy(void *dst, const void *src, uint32_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+
+static uint32_t kstrlen(const char *s) {
+    uint32_t n = 0;
+    while (s && s[n]) n++;
+    return n;
+}
+
+static int kstrncmp(const char *a, const char *b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (ca == '\0' && cb == '\0') return 0;
+        if (ca == '\0' || cb == '\0') return (int)ca - (int)cb;
+        if (ca != cb) return (int)ca - (int)cb;
+    }
+    return 0;
+}
+
+static void kstrncpy(char *dst, const char *src, uint32_t n) {
+    if (n == 0) return;
+    uint32_t i = 0;
+    for (; i + 1 < n && src[i]; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+/* ---- FS storage ---- */
+static fs_entry_t fs_entries[FS_MAX_FILES];
+
+/* helper: find free slot */
+static int find_free(void) {
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (!fs_entries[i].used) return i;
+    }
+    return -1;
+}
+
+/* helper: find child by name under parent index */
+static int find_child(int parent_idx, const char *name) {
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (fs_entries[i].used && fs_entries[i].parent == parent_idx) {
+            if (kstrncmp(fs_entries[i].name, name, FS_NAME_MAX) == 0) return i;
+        }
+    }
+    return -1;
+}
+
+/* helper: split next component from path.
+   in: p points to component (no leading '/'), out: copy comp into compbuf (size FS_NAME_MAX),
+   returns pointer after component (skip any '/') or NULL if component invalid.
+*/
+static const char *get_next_component(const char *p, char *compbuf) {
+    if (!p || *p == '\0') return NULL;
+    uint32_t i = 0;
+    while (*p != '\0' && *p != '/') {
+        if (i + 1 < FS_NAME_MAX) compbuf[i++] = *p;
+        else return NULL; /* component too long */
+        p++;
+    }
+    compbuf[i] = '\0';
+    if (*p == '/') return p + 1;
+    return p;
+}
+
+/* Initialize: clear and create root (index 0) */
+void fs_init(void) {
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        fs_entries[i].used = 0;
+        fs_entries[i].size = 0;
+        fs_entries[i].name[0] = '\0';
+        fs_entries[i].is_dir = 0;
+        fs_entries[i].parent = -1;
+    }
+    /* reserve index 0 as root directory */
+    fs_entries[0].used = 1;
+    kstrncpy(fs_entries[0].name, "/", FS_NAME_MAX);
+    fs_entries[0].is_dir = 1;
+    fs_entries[0].parent = 0;
+    fs_entries[0].size = 0;
+}
+
+/* Resolve path: absolute (/a/b) or relative (no cwd handled here) starting at root.
+   Returns entry index or -1 if not found
+   Note: accepts "/" -> returns root
+*/
+int fs_resolve(const char *path) {
+    if (!path) return -1;
+    if (path[0] == '\0') return -1;
+    if (path[0] == '/' && (path[1] == '\0')) return 0; /* root */
+
+    int cur = 0; /* start at root for absolute paths or implicit root for relative */
+    const char *p = path;
+    if (p[0] == '/') p++; /* skip leading slash */
+
+    char comp[FS_NAME_MAX];
+    const char *next = p;
+    while (next && *next) {
+        next = get_next_component(next, comp);
+        if (!comp[0]) return -1;
+        int child = find_child(cur, comp);
+        if (child < 0) return -1;
+        cur = child;
+        if (next && *next == '\0') break;
+    }
+    return cur;
+}
+
+/* Internal: create an entry in parent index (file or dir) */
+int fs_create_in_parent(int parent_idx, const char *name, const uint8_t *data, uint32_t len, uint8_t is_dir) {
+    if (!name || name[0] == '\0') return -1;
+    if (kstrlen(name) >= FS_NAME_MAX) return -1;
+    if (parent_idx < 0 || parent_idx >= FS_MAX_FILES) return -1;
+    if (!fs_entries[parent_idx].used || !fs_entries[parent_idx].is_dir) return -1;
+
+    if (find_child(parent_idx, name) >= 0) return -1; /* exists */
+
+    int idx = find_free();
+    if (idx < 0) return -1;
+
+    kstrncpy(fs_entries[idx].name, name, FS_NAME_MAX);
+    fs_entries[idx].used = 1;
+    fs_entries[idx].is_dir = (is_dir ? 1 : 0);
+    fs_entries[idx].parent = parent_idx;
+    if (!is_dir) {
+        if (len > FS_FILE_MAX) return -1;
+        fs_entries[idx].size = len;
+        if (len && data) kmemcpy(fs_entries[idx].data, data, len);
+    } else {
+        fs_entries[idx].size = 0;
+    }
+    return 0;
+}
+
+/* Resolve parent dir and filename for a path like "/a/b/c.txt" */
+/* On success: *parent_idx set, name_out filled, return 0. On failure return -1. */
+static int resolve_parent_and_name(const char *path, int *parent_idx, char *name_out) {
+    if (!path || !parent_idx || !name_out) return -1;
+    /* strip trailing slashes */
+    uint32_t plen = kstrlen(path);
+    if (plen == 0) return -1;
+
+    /* Handle absolute path */
+    const char *p = path;
+    int cur = 0; /* start at root */
+    if (p[0] == '/') p++; /* skip leading slash */
+
+    char comp[FS_NAME_MAX];
+    const char *next = p;
+    const char *last_comp = NULL;
+    int last_parent = cur;
+
+    while (next && *next) {
+        last_parent = cur;
+        next = get_next_component(next, comp);
+        if (!comp[0]) return -1;
+        /* if there's more after this, descend; else this comp is the final name */
+        if (next && *next) {
+            int child = find_child(cur, comp);
+            if (child < 0) return -1;
+            if (!fs_entries[child].is_dir) return -1;
+            cur = child;
+        } else {
+            /* final component */
+            kstrncpy(name_out, comp, FS_NAME_MAX);
+            *parent_idx = cur;
+            return 0;
+        }
+    }
+    /* If path ended without components (like "/" ) */
+    return -1;
+}
+
+/* Create directory by path */
+int fs_mkdir(const char *path) {
+    int parent;
+    char name[FS_NAME_MAX];
+    if (resolve_parent_and_name(path, &parent, name) != 0) return -1;
+    return fs_create_in_parent(parent, name, NULL, 0, 1);
+}
+
+/* Create or overwrite file by path */
+int fs_write_path(const char *path, const uint8_t *data, uint32_t len) {
+    int parent;
+    char name[FS_NAME_MAX];
+    if (resolve_parent_and_name(path, &parent, name) != 0) return -1;
+    int existing = find_child(parent, name);
+    if (existing >= 0) {
+        /* if existing is dir, fail */
+        if (fs_entries[existing].is_dir) return -1;
+        if (len > FS_FILE_MAX) return -1;
+        fs_entries[existing].size = len;
+        if (len && data) kmemcpy(fs_entries[existing].data, data, len);
+        return 0;
+    } else {
+        return fs_create_in_parent(parent, name, data, len, 0);
+    }
+}
+
+/* Read file by path */
+int fs_read_path(const char *path, uint8_t *buf, uint32_t bufsize) {
+    int idx = fs_resolve(path);
+    if (idx < 0) return -1;
+    if (fs_entries[idx].is_dir) return -1;
+    uint32_t tocopy = fs_entries[idx].size;
+    if (tocopy > bufsize) tocopy = bufsize;
+    if (tocopy && buf) kmemcpy(buf, fs_entries[idx].data, tocopy);
+    return (int)tocopy;
+}
+
+/* Remove file (path) */
+int fs_remove_path(const char *path) {
+    int idx = fs_resolve(path);
+    if (idx < 0) return -1;
+    if (fs_entries[idx].is_dir) return -1;
+    fs_entries[idx].used = 0;
+    fs_entries[idx].name[0] = '\0';
+    fs_entries[idx].size = 0;
+    fs_entries[idx].parent = -1;
+    return 0;
+}
+
+/* Remove directory if empty */
+int fs_rmdir(const char *path) {
+    int idx = fs_resolve(path);
+    if (idx < 0) return -1;
+    if (!fs_entries[idx].is_dir) return -1;
+    /* check children */
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (fs_entries[i].used && fs_entries[i].parent == idx) return -1; /* not empty */
+    }
+    if (idx == 0) return -1; /* cannot remove root */
+    fs_entries[idx].used = 0;
+    fs_entries[idx].name[0] = '\0';
+    fs_entries[idx].parent = -1;
+    return 0;
+}
+
+/* List directory contents by path */
+int fs_list_dir(const char *path, fs_list_cb_t cb, void *cookie) {
+    int idx;
+    if (!path || path[0] == '\0') idx = 0;
+    else idx = fs_resolve(path);
+    if (idx < 0) return -1;
+    if (!fs_entries[idx].is_dir) return -1;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (fs_entries[i].used && fs_entries[i].parent == idx) {
+            cb(fs_entries[i].name, fs_entries[i].size, fs_entries[i].is_dir, cookie);
+        }
+    }
+    return 0;
+}
+
+Kernel changes (shell) — add mkdir, cd, pwd, rmdir
+
+Open src/kernel.c and:
+
+Add #include "fs.h" (if not already).
+
+Add a small cwd buffer and helper to join paths for relative resolution.
+
+Add command handlers for mkdir, cd, pwd, and rmdir; enhance ls to accept a path.
+
+Below is a drop-in code block you can add to kernel.c. Place it after your helper functions (after fs_list_cb and before kmain), and inside kmain adapt command parsing to include the new commands. (If you have the latest kernel.c from earlier steps, copy/paste these additions.)
+
+/* ---- Shell cwd helper ---- */
+static char cwd[128] = "/"; /* default root */
+
+/* join path: if 'path' starts with '/', return it as absolute; otherwise produce joined path into outbuf */
+static void join_path(const char *path, char *outbuf, int outlen) {
+    if (!path || path[0] == '\0') {
+        /* copy cwd */
+        int i = 0;
+        while (cwd[i] && i + 1 < outlen) { outbuf[i] = cwd[i]; i++; }
+        outbuf[i] = '\0';
+        return;
+    }
+    if (path[0] == '/') {
+        /* absolute */
+        int i = 0;
+        while (path[i] && i + 1 < outlen) { outbuf[i] = path[i]; i++; }
+        outbuf[i] = '\0';
+        return;
+    }
+    /* relative: if cwd is "/" then result is "/name" else "cwd/name" */
+    int ci = 0, oi = 0;
+    if (cwd[0] == '/' && cwd[1] == '\0') {
+        if (oi + 1 < outlen) outbuf[oi++] = '/';
+    } else {
+        while (cwd[ci] && oi + 1 < outlen) outbuf[oi++] = cwd[ci++];
+        if (oi + 1 < outlen && outbuf[oi-1] != '/') outbuf[oi++] = '/';
+    }
+    int pi = 0;
+    while (path[pi] && oi + 1 < outlen) outbuf[oi++] = path[pi++];
+    outbuf[oi] = '\0';
+}
+
+/* cd command: change cwd if directory exists */
+static int shell_cd(const char *arg) {
+    char full[128];
+    join_path(arg, full, sizeof(full));
+    if (full[0] == '\0') return -1;
+    if (full[0] != '/') {
+        /* ensure leading slash */
+        char tmp[128];
+        tmp[0] = '/';
+        int i = 1; int j = 0;
+        while (full[j] && i + 1 < (int)sizeof(tmp)) tmp[i++] = full[j++];
+        tmp[i] = '\0';
+        for (int k = 0; k <= i; k++) full[k] = tmp[k];
+    }
+    int idx = fs_resolve(full);
+    if (idx < 0) return -1;
+    /* must be dir */
+    extern fs_entry_t fs_entries[]; /* we can't reference fs_entries directly; we can rely on fs_list_dir to check */
+    /* safer: test by listing */
+    if (fs_list_dir(full, (fs_list_cb_t)0, NULL) != 0) return -1;
+    /* copy full into cwd */
+    int ci = 0;
+    while (full[ci] && ci + 1 < (int)sizeof(cwd)) { cwd[ci] = full[ci]; ci++; }
+    cwd[ci] = '\0';
+    return 0;
+}
+
+/* pwd */
+static void shell_pwd(void) {
+    uart_puts(cwd);
+    uart_puts("\n");
+}
+
+/* callback for listing that prints directories with a slash */
+static void fs_list_cb_shell(const char *name, uint32_t size, uint8_t is_dir, void *cookie) {
+    (void)cookie;
+    uart_puts("  ");
+    uart_puts(name);
+    if (is_dir) uart_puts("/");
+    uart_puts("\n");
+}
+
+
+Now inside your kmain() command handling replace/add command branches as follows (these are snippets — integrate with your existing if/else chain):
+
+/* ls [path] */
+else if (kstrncmp(line, "ls", 2) == 0 && (line[2] == '\0' || line[2] == ' ')) {
+    const char *arg = line + 2;
+    if (*arg == ' ') arg++;
+    char pathbuf[128];
+    if (*arg == '\0') {
+        /* list cwd */
+        join_path("", pathbuf, sizeof(pathbuf));
+    } else {
+        join_path(arg, pathbuf, sizeof(pathbuf));
+    }
+    if (fs_list_dir(pathbuf, fs_list_cb_shell, NULL) != 0) {
+        uart_puts("Not a directory or not found\n");
+    }
+}
+
+/* mkdir <path> */
+else if (kstrncmp(line, "mkdir ", 6) == 0) {
+    const char *arg = line + 6;
+    if (*arg == '\0') { uart_puts("Usage: mkdir <path>\n"); }
+    else {
+        char pathbuf[128];
+        join_path(arg, pathbuf, sizeof(pathbuf));
+        if (fs_mkdir(pathbuf) == 0) uart_puts("OK\n");
+        else uart_puts("mkdir failed\n");
+    }
+}
+
+/* rmdir <path> */
+else if (kstrncmp(line, "rmdir ", 6) == 0) {
+    const char *arg = line + 6;
+    if (*arg == '\0') { uart_puts("Usage: rmdir <path>\n"); }
+    else {
+        char pathbuf[128];
+        join_path(arg, pathbuf, sizeof(pathbuf));
+        if (fs_rmdir(pathbuf) == 0) uart_puts("Removed\n");
+        else uart_puts("rmdir failed (non-empty or not found)\n");
+    }
+}
+
+/* cd <path> */
+else if (kstrncmp(line, "cd ", 3) == 0) {
+    const char *arg = line + 3;
+    if (*arg == '\0') { uart_puts("Usage: cd <path>\n"); }
+    else {
+        if (shell_cd(arg) == 0) uart_puts("OK\n");
+        else uart_puts("cd failed\n");
+    }
+}
+
+/* pwd */
+else if (streq(line, "pwd")) {
+    shell_pwd();
+}
+
+/* write and cat commands: use join_path to resolve full path before calling fs_* */
+else if (kstrncmp(line, "cat ", 4) == 0) {
+    const char *name = line + 4;
+    if (*name) {
+        char pathbuf[128];
+        join_path(name, pathbuf, sizeof(pathbuf));
+        uint8_t buf[FS_FILE_MAX];
+        int r = fs_read_path(pathbuf, buf, sizeof(buf));
+        if (r < 0) {
+            uart_puts("File not found or is a directory\n");
+        } else {
+            for (int i = 0; i < r; i++) uart_putc((char)buf[i]);
+            uart_putc('\n');
+        }
+    } else {
+        uart_puts("Usage: cat <path>\n");
+    }
+}
+else if (kstrncmp(line, "write ", 6) == 0) {
+    char *p = line + 6;
+    if (*p == '\0') { uart_puts("Usage: write <path> <text>\n"); }
+    else {
+        char *space = p;
+        while (*space && *space != ' ') space++;
+        if (*space == '\0') { uart_puts("Usage: write <path> <text>\n"); }
+        else {
+            *space = '\0';
+            const char *name = p;
+            const char *text = space + 1;
+            char pathbuf[128];
+            join_path(name, pathbuf, sizeof(pathbuf));
+            if (fs_write_path(pathbuf, (const uint8_t*)text, (uint32_t)kstrlen(text)) == 0) uart_puts("OK\n");
+            else uart_puts("write failed\n");
+        }
+    }
+}
+
+
+Note: these snippets expect your kernel to have kstrncmp and kstrlen defined (from earlier steps). If you don’t, add the tiny helpers exactly as earlier.
+
+Build & test
+
+Ensure src/fs.c and src/fs.h are updated as above.
+
+Ensure src/kernel.c includes #include "fs.h" and the new shell code is added.
+
+Make sure the Makefile still compiles src/fs.c (it should).
+
+Run:
+
+make clean
+make
+make run
+
+
+Test sequence in QEMU:
+
+> ls
+Files:
+  hello.txt
+
+> mkdir /docs
+OK
+
+> ls /
+  hello.txt
+  docs/
+
+> write /docs/readme.txt This is the docs folder
+OK
+
+> ls /docs
+  readme.txt
+
+> cat /docs/readme.txt
+This is the docs folder
+
+> cd /docs
+OK
+
+> pwd
+/docs
+
+> ls
+  readme.txt
+
+> mkdir projects
+OK
+> ls
+  readme.txt
+  projects/
+
+> rmdir projects
+Removed
+
+> rm /docs/readme.txt
+Removed
+
+> ls /docs
+<empty>
+
+Notes, limits, and possible follow-ups
+
+This is intentionally simple: directories are implemented by parent indices — no indexing acceleration, no path normalization beyond simple handling, and no .. parent traversal support (we can add it).
+
+Name length still limited by FS_NAME_MAX. Path length limited by kernel cwd/buffers (128 here).
+
+rmdir only removes empty directories.
+
+Concurrency, permissions, and persistence are still not implemented.
+
+If you want .. and . handling, or symbolic links, or relative ../x resolution, I can add those quickly.
+
+If you prefer resolving relative paths starting from cwd when path does not begin with /, the join_path helper above already does that.
+
+Want me to do any of these next?
+
+Add .. and . path components handling.
+
+Make cd .. work and allow relative ../.
+
+Improve path normalization (collapse //, ./, ../).
+
+Add persistence: embed a tiny image or allow reading a disk.img from QEMU memory.
+
+Add find or recursive ls -R.
+
+Tell me which of the above (or say “just give me the files ready to paste”), and I’ll produce the full ready-to-paste versions for fs.h, fs.c, and the kernel.c snippets integrated in one copy-pasteable kernel.c if you want.
